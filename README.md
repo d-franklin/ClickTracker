@@ -1,11 +1,189 @@
-# ClickTracker performance
+# ClickTracker
 
-Measured performance of the ClickTracker redirect path, using the k6 scripts in `loadtest/`.
+Self-hosted URL shortener that records who clicked a short link, from where, and with what browser.
 
-**The load generator and the service ran on the same 32-core host.** k6 consumed more CPU than
-the service in every measurement, so the throughput figures below are a floor, not a ceiling.
+A short path returns a `302` to the target URL and captures the request. Clicks are queued in
+memory and written to SQLite by a background worker, so the redirect never waits on storage. The
+storage sits behind an interface, so the same redirect service can later export to OpenTelemetry
+and Grafana Alloy without changing the request path.
 
-## Headline
+## What it does
+
+- **Short link resolution** — `GET /{id}` returns a `302` to the URL configured for that ID.
+- **Click capture** — every click records all request headers verbatim, the client address, the
+  request method, scheme and host, and a UTC timestamp.
+- **Asynchronous persistence** — captured clicks are queued in memory and written by a background
+  worker, so the redirect is never delayed by storage.
+- **SQLite click storage** — clicks are persisted through a storage interface that a later
+  OTEL / Grafana Alloy implementation can replace.
+- **Link configuration file** — a JSON file separate from `appsettings.json` maps link IDs to target
+  URLs. It is loaded at startup and reloaded automatically when it changes on disk.
+- **Admin API** — an authenticated API creates, replaces, deletes and lists links by writing the
+  link file.
+
+Bot traffic is recorded like any other click, and the service never serves a landing page. It
+only issues redirects.
+
+## Quick start
+
+```bash
+dotnet run --project ClickTracker
+```
+
+The service listens on `http://localhost:5235`. With the default `links.json`:
+
+```bash
+curl -i http://localhost:5235/example
+# HTTP/1.1 302 Found
+# Location: https://example.com
+```
+
+Add a link:
+
+```bash
+curl -X PUT http://localhost:5235/admin/links/my-link \
+  -H 'X-Api-Key: your-key' \
+  -H 'Content-Type: application/json' \
+  -d '{"url":"https://example.org"}'
+```
+
+The admin key comes from OpenBao, then `CLICKTRACKER_ADMIN_API_KEY`, then `appsettings.json`. The
+simplest way to set it locally is the environment variable.
+
+## How it works
+
+One ASP.NET Core process serves two surfaces.
+
+**The redirect** (`GET /{id}`) resolves the ID against an in-memory snapshot of the link file,
+materialises the request into a click record, hands it to a bounded queue with a non-blocking
+write, and returns `302 Found`. No storage I/O happens on this path.
+
+**The click writer** is a background service that drains the queue in batches and writes each
+batch through `IClickStore` in one transaction. A failed batch is retried a bounded number of
+times and then dropped with an error log, so a storage fault never stops the service.
+
+**The link file** is the source of truth. It is watched for changes, debounced, then re-read and
+swapped in as a new snapshot. A malformed file leaves the previous snapshot in force. The admin
+API writes the file and updates the snapshot itself, so an admin write is visible in the next
+request without waiting for the watcher.
+
+```
+                    ┌─────────────────────────────────────────┐
+   GET /{id}  ────► │  LinkStore  ──► in-memory snapshot      │
+                    │                  (cache, never authority)│
+                    └──────────────┬──────────────────────────┘
+                                   │ target URL
+                                   ▼
+                    ┌─────────────────────────────────────────┐
+                    │  ClickCapture ──► ClickQueue (bounded)  │
+                    └──────────────┬──────────────────────────┘
+                                   │ non-blocking write
+                                   ▼
+                    ┌─────────────────────────────────────────┐
+                    │  ClickWriter (background)               │
+                    │    └──► IClickStore ──► SQLite (WAL)    │
+                    └─────────────────────────────────────────┘
+```
+
+### Modules
+
+| Module | Owns | Depends on |
+|---|---|---|
+| `Links` | The link file and the in-memory snapshot | — |
+| `Clicks` | Click capture, the queue and the storage interface | — |
+| `Admin` | The admin API and the admin API key | `Links` |
+
+`Clicks` does not depend on `Links`. The redirect handler passes the resolved link ID and target
+URL into the click record, so the click pipeline has no knowledge of link storage.
+
+Full detail lives in [`architecture.md`](architecture.md) and the per-module specs.
+
+## Admin API
+
+Every route requires the `X-Api-Key` header. There is no unauthenticated admin route.
+
+| Method | Route | Body | Result |
+|---|---|---|---|
+| `GET` | `/admin/links` | — | `200` with the list of links |
+| `PUT` | `/admin/links/{id}` | `{"url":"https://..."}` | `200`, or `400` if the ID or URL is invalid |
+| `DELETE` | `/admin/links/{id}` | — | `204`, or `404` if the ID is unknown |
+
+Link IDs may not contain `/` or whitespace, and may not start with `admin`. Target URLs must be
+absolute `http` or `https` URLs.
+
+```bash
+curl http://localhost:5235/admin/links -H 'X-Api-Key: your-key'
+# [{"id":"example","url":"https://example.com"}]
+```
+
+## Configuration
+
+`appsettings.json` holds application settings. Link definitions live in their own file and are
+never part of application configuration.
+
+```json
+{
+  "Links": { "FilePath": "links.json" },
+  "Clicks": {
+    "DatabasePath": "clicks.db",
+    "QueueCapacity": 10000,
+    "BatchSize": 100,
+    "BatchIntervalMs": 250
+  },
+  "Admin": {
+    "ApiKey": "",
+    "OpenBao": { "Address": "", "SecretPath": "secret/data/clicktracker" }
+  },
+  "ForwardedHeaders": {
+    "KnownNetworks": ["10.0.0.0/8"],
+    "KnownProxies": []
+  }
+}
+```
+
+| Variable | Purpose |
+|---|---|
+| `CLICKTRACKER_ADMIN_API_KEY` | Admin API key, used when OpenBao has none |
+| `OPENBAO_ADDR` | OpenBao address |
+| `OPENBAO_TOKEN` | OpenBao token |
+| `OPENBAO_SECRET_PATH` | Path to the secret, defaults to `secret/data/clicktracker` |
+| `ASPNETCORE_URLS` | Listen address, defaults to `http://localhost:5235` |
+
+The OpenBao secret is expected at `{Address}/v1/{SecretPath}` with an `adminApiKey` field. A key
+that does not match triggers one re-read, so rotation works with no restart.
+
+`QueueCapacity` is a hard bound. When the queue is full the oldest click is discarded rather than
+letting memory grow, and the count is logged so the loss is visible.
+
+## Reading the clicks
+
+Clicks are read by querying SQLite directly.
+
+```bash
+sqlite3 clicks.db 'SELECT link_id, COUNT(*) FROM clicks GROUP BY link_id;'
+sqlite3 clicks.db 'SELECT occurred_at_utc, link_id, client_address, headers_json FROM clicks LIMIT 5;'
+```
+
+| Column | Type | Notes |
+|---|---|---|
+| `id` | `INTEGER PRIMARY KEY AUTOINCREMENT` | |
+| `occurred_at_utc` | `TEXT` | ISO-8601 UTC, taken when the request arrived |
+| `link_id` | `TEXT` | The short ID that was clicked |
+| `target_url` | `TEXT` | Kept so a later link change does not rewrite history |
+| `client_address` | `TEXT` | Null when the address is unknown |
+| `method` | `TEXT` | |
+| `scheme` | `TEXT` | |
+| `host` | `TEXT` | |
+| `headers_json` | `TEXT` | Every request header, verbatim, as a JSON object of string arrays |
+
+Indexed on `link_id` and `occurred_at_utc`. The database runs in WAL mode so clicks can be read
+while they are written.
+
+## Performance
+
+Measured with the k6 scripts in [`loadtest/`](loadtest/). **The load generator and the service ran
+on the same 32-core host**, and k6 consumed more CPU than the service in every measurement, so
+the throughput figures are a floor rather than a ceiling.
 
 30,000 req/s sustained for 5 minutes, p95 0.26 ms, p99 2.03 ms, zero failed requests.
 
@@ -19,24 +197,8 @@ the service in every measurement, so the throughput figures below are a floor, n
 | Clicks dropped | 0 |
 | Resident memory | 145 MB → 139 MB (flat) |
 | Open file descriptors | 16 → 719 → 16 at rest |
-| Threads | 86-95 |
 
-## Test environment
-
-| | |
-|---|---|
-| Service | Native AOT publish (`dotnet publish -r linux-x64 -c Release`) |
-| Runtime | .NET 10, ASP.NET Core minimal API, HTTP only |
-| Load generator | k6 v2.3.0, same host |
-| Host | 32 CPUs, 62 GB RAM, Linux, loopback |
-| Links | 51 IDs, loaded from an isolated `links.json` |
-| Database | Isolated `clicks.db`, WAL mode |
-| Traffic mix | 85% `GET` on a known ID, 5% `HEAD` on a known ID, 10% `GET` on an unknown ID |
-
-Every request asserted the response status, the presence of a `Location` header, and that the
-`Location` matched the configured target URL. Redirects were not followed.
-
-## Closed loop
+### Closed loop
 
 `ramping-vus`, 10 s ramp, 30 s steady, 5 s drain. Throughput peaks, then falls away as latency
 grows.
@@ -53,7 +215,7 @@ grows.
 
 Zero failed requests at every level. The knee is at 100 VUs.
 
-## Open loop
+### Open loop
 
 `constant-arrival-rate`, 30 s per level. This is the meaningful latency measure, because the
 offered rate is fixed regardless of how slow the service gets.
@@ -69,21 +231,7 @@ offered rate is fixed regardless of how slow the service gets.
 Zero failed requests at every level. The service ceiling is roughly 65,000 req/s; above that, k6
 could not land the arrivals and dropped 9.4% of them.
 
-## Redirect path without click capture
-
-`HEAD` requests are not recorded as clicks, so a HEAD-only run isolates the link lookup and
-redirect from the click pipeline.
-
-| VUs | req/s | avg | p95 | p99 |
-|---:|---:|---:|---:|---:|
-| 100 | 106,091 | 0.684 ms | 1.32 ms | 2.08 ms |
-| **200** | **113,334** | 1.239 ms | 2.56 ms | 3.81 ms |
-| 400 | 110,096 | 1.786 ms | 3.84 ms | 6.11 ms |
-
-Click capture costs about 22% of peak throughput: 88,513 req/s mixed against 113,334 req/s for
-HEAD-only traffic.
-
-## The click pipeline breaks first
+### The click pipeline breaks first
 
 The redirect path never touches storage, so the first thing to fail under load is the queue that
 feeds SQLite.
@@ -94,24 +242,15 @@ feeds SQLite.
 | Closed-loop sweep, peak | ~75,000 | 49,022 | 29.9% |
 
 The SQLite writer sustained about 25,500 clicks/s with zero drops. Above roughly 75,000 clicks/s
-it fell behind, and the bounded `DropOldest` queue discarded the oldest clicks. Across the sweep
-that was 6,024,079 of the 20,126,538 clicks enqueued.
+it fell behind, and the bounded `DropOldest` queue discarded the oldest clicks — 6,024,079 of the
+20,126,538 clicks enqueued across the sweep. A dropped click is invisible to the client: the
+request still returns a `302`, and the loss only shows up in the service log as
+`N clicks were dropped`.
 
-A dropped click is invisible to the client. The request still returns a 302; the loss only shows
-up in the service log as `N clicks were dropped`.
+Each click row costs about 247 bytes, dominated by the verbatim header capture. 35.5M clicks
+occupied 8.37 GB.
 
-### Storage cost
-
-| | |
-|---|---|
-| Click rows | 35,496,692 |
-| Database size | 8.37 GB (247 bytes per row) |
-| Growth rate | 5.4 MB/s under 25,500 clicks/s |
-| WAL file | bounded at 36 MB by checkpointing |
-
-The row size is dominated by the verbatim header capture.
-
-## CPU cost
+### CPU cost
 
 | Run | App CPU | k6 CPU | App CPU per request |
 |---|---:|---:|---:|
@@ -122,39 +261,54 @@ The row size is dominated by the verbatim header capture.
 At roughly 100 µs of CPU per request, the redirect path is the throughput ceiling on a single
 host. The app burned more than two cores at 20,000 req/s.
 
-## What this does not cover
+### What the numbers do not cover
 
 - Behaviour behind a reverse proxy, with TLS termination, or with forwarded headers from a real
   proxy. The test ran against Kestrel directly on loopback.
 - The admin API. It is not on the request path under test.
-- Click durability under sustained overload. The 29.9% loss figure is a characterisation of the
-  queue's `DropOldest` behaviour, not a measured failure threshold.
-- Click loss over a restart. The queue is in memory, so anything still queued at shutdown is
-  lost.
+- Click durability under sustained overload. The 29.9% loss figure characterises the queue's
+  `DropOldest` behaviour, it is not a measured failure threshold.
+- Click loss over a restart. The queue is in memory, so anything still queued at shutdown is lost.
 - Any other storage backend. `IClickStore` has exactly one implementation here.
 
-## Reproducing
+See [`loadtest/README.md`](loadtest/README.md) for how to run the tests.
+
+## Development
 
 ```bash
-dotnet publish ClickTracker/ClickTracker.csproj -r linux-x64 -c Release -o /tmp/ct-publish
+# Run the service.
+dotnet run --project ClickTracker
 
-# Run the service against an isolated links.json and clicks.db. Point Links:FilePath and
-# Clicks:DatabasePath at absolute paths so the repo's own files are left alone.
-mkdir -p /tmp/ct-run
-cp /tmp/ct-publish/appsettings.json /tmp/ct-run/
-cp ClickTracker/links.json /tmp/ct-run/
-cd /tmp/ct-run && ASPNETCORE_URLS=http://127.0.0.1:5080 /tmp/ct-publish/ClickTracker
+# Run the tests.
+dotnet test --project ClickTracker.Tests/ClickTracker.Tests.csproj
 
-# Sweep the VU count.
-export BASE_URL=http://127.0.0.1:5080
-export LINK_IDS=link-001,link-002,link-003
-loadtest/run-matrix.sh --vus 10,25,50,100,200,400,800
-
-# Or hold a fixed arrival rate.
-loadtest/run-matrix.sh --executor constant-arrival-rate --rates 20000,30000,40000
-
-# Measure CPU per request and click throughput.
-loadtest/measure-cost.sh 20000 60s
+# Publish the native binary.
+dotnet publish ClickTracker/ClickTracker.csproj -r linux-x64 -c Release -o ./publish
 ```
 
-See `loadtest/README.md` for the script's options.
+The project targets .NET 10 and publishes as Native AOT. `dotnet run` JITs locally; the published
+binary is native and needs no runtime installed.
+
+Tests cover each module against a temporary directory or database, plus an integration test that
+asserts the `302`, the `Location` header, and that the click reaches the database through the
+queue.
+
+## Project layout
+
+```
+ClickTracker/
+├── Program.cs              Composition root, routes, middleware
+├── Links/                  Link file, validation, in-memory snapshot
+├── Clicks/                 Click capture, bounded queue, SQLite store
+├── Admin/                  Admin API and API key resolution
+├── appsettings.json        Application configuration
+└── links.json              Link definitions
+ClickTracker.Tests/         Unit and integration tests
+loadtest/                   k6 scripts and reporting
+architecture.md             Architecture, decisions, invariants
+goal-and-requirements.md    Scope and capability decisions
+```
+
+## License
+
+Not specified.
