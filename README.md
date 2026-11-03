@@ -293,6 +293,29 @@ Tests cover each module against a temporary directory or database, plus an integ
 asserts the `302`, the `Location` header, and that the click reaches the database through the
 queue.
 
+### Pre-commit secret scan
+
+`.githooks/pre-commit` runs [trufflehog](https://github.com/trufflesecurity/trufflehog) over the
+staged files and blocks the commit when it finds something that looks like a secret. Only staged
+files are scanned, so the check is fast and only reports what the commit introduces. Binary files
+are skipped.
+
+Enable it in a clone:
+
+```bash
+scripts/install-hooks.sh
+```
+
+or `git config core.hooksPath .githooks`.
+
+| Variable | Effect |
+|---|---|
+| `TRUFFLEHOG_SKIP=1` | skip the scan for one commit |
+| `TRUFFLEHOG_VERIFY=1` | let trufflehog verify findings against the provider, which needs network access |
+| `TRUFFLEHOG_REQUIRED=1` | fail the commit when trufflehog is not installed, instead of warning |
+
+A false positive is suppressed with a `trufflehog:ignore` comment on the line that triggered it.
+
 ## Project layout
 
 ```
@@ -305,6 +328,8 @@ ClickTracker/
 └── links.json              Link definitions
 ClickTracker.Tests/         Unit and integration tests
 loadtest/                   k6 scripts and reporting
+.githooks/                  Versioned git hooks
+scripts/                    Repository setup scripts
 architecture.md             Architecture, decisions, invariants
 goal-and-requirements.md    Scope and capability decisions
 ```
