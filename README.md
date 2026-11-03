@@ -67,22 +67,15 @@ swapped in as a new snapshot. A malformed file leaves the previous snapshot in f
 API writes the file and updates the snapshot itself, so an admin write is visible in the next
 request without waiting for the watcher.
 
-```
-                    ┌─────────────────────────────────────────┐
-   GET /{id}  ────► │  LinkStore  ──► in-memory snapshot      │
-                    │                  (cache, never authority)│
-                    └──────────────┬──────────────────────────┘
-                                   │ target URL
-                                   ▼
-                    ┌─────────────────────────────────────────┐
-                    │  ClickCapture ──► ClickQueue (bounded)  │
-                    └──────────────┬──────────────────────────┘
-                                   │ non-blocking write
-                                   ▼
-                    ┌─────────────────────────────────────────┐
-                    │  ClickWriter (background)               │
-                    │    └──► IClickStore ──► SQLite (WAL)    │
-                    └─────────────────────────────────────────┘
+```mermaid
+flowchart TD
+    request["GET /{id}"] -->|"resolves"| links["LinkStore"]
+    links --> snapshot["In-memory snapshot<br/>(cache, never the authority)"]
+    snapshot -->|"target URL"| capture["ClickCapture"]
+    capture -->|"non-blocking write"| queue["ClickQueue<br/>(bounded)"]
+    queue -->|"drain in batches"| writer["ClickWriter<br/>(background service)"]
+    writer --> store["IClickStore"]
+    store --> db[("SQLite (WAL)")]
 ```
 
 ### Modules
