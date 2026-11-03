@@ -311,4 +311,4 @@ goal-and-requirements.md    Scope and capability decisions
 
 ## License
 
-Not specified.
+[MIT](LICENSE) © 2026 Daniel Franklin
