@@ -1,0 +1,97 @@
+#!/usr/bin/env bash
+#
+# Pre-commit hook: blocks a commit that stages a secret.
+#
+# Only the staged files are scanned, so the check is fast and only reports what this commit
+# introduces. Binary files are skipped, because trufflehog matches on byte patterns and a build
+# artefact produces noise rather than a finding.
+#
+# Environment:
+#   TRUFFLEHOG_SKIP=1      skip the scan for this commit
+#   TRUFFLEHOG_VERIFY=1    let trufflehog verify findings against the provider (needs network)
+#   TRUFFLEHOG_REQUIRED=1  fail the commit when trufflehog is not installed, instead of warning
+#
+# Enable it in a clone with: git config core.hooksPath .githooks
+# or run scripts/install-hooks.sh
+
+set -euo pipefail
+
+if [[ "${TRUFFLEHOG_SKIP:-0}" == "1" ]]; then
+    echo "pre-commit: secret scan skipped (TRUFFLEHOG_SKIP=1)"
+    exit 0
+fi
+
+if ! command -v trufflehog > /dev/null 2>&1; then
+    if [[ "${TRUFFLEHOG_REQUIRED:-0}" == "1" ]]; then
+        echo "pre-commit: trufflehog is not installed and TRUFFLEHOG_REQUIRED=1 is set." >&2
+        echo "pre-commit: install trufflehog, or unset TRUFFLEHOG_REQUIRED to allow the commit." >&2
+        exit 1
+    fi
+
+    echo "pre-commit: trufflehog is not installed, so no secret scan ran." >&2
+    echo "pre-commit: install it and re-run the commit, or set TRUFFLEHOG_SKIP=1 once you have" >&2
+    echo "pre-commit: checked the staged files yourself." >&2
+    exit 0
+fi
+
+staged=()
+while IFS= read -r -d '' file; do
+    if [[ -f "$file" ]] && LC_ALL=C grep -qI . "$file" 2> /dev/null; then
+        staged+=("$file")
+    fi
+done < <(git diff --cached --name-only --diff-filter=ACMR -z)
+
+if [[ ${#staged[@]} -eq 0 ]]; then
+    exit 0
+fi
+
+verification=(--no-verification)
+if [[ "${TRUFFLEHOG_VERIFY:-0}" == "1" ]]; then
+    verification=()
+fi
+
+findings="$(trufflehog filesystem "${verification[@]}" --json -- "${staged[@]}" 2> /dev/null || true)"
+
+if [[ -z "${findings//[[:space:]]/}" ]]; then
+    exit 0
+fi
+
+echo "pre-commit: trufflehog found what looks like a secret in the staged files." >&2
+echo >&2
+
+if command -v python3 > /dev/null 2>&1; then
+    printf '%s\n' "$findings" | python3 -c '
+import json
+import sys
+
+for line in sys.stdin:
+    line = line.strip()
+    if not line:
+        continue
+    try:
+        finding = json.loads(line)
+    except ValueError:
+        continue
+    if "DetectorName" not in finding:
+        continue
+
+    source = finding.get("SourceMetadata", {}).get("Data", {}).get("Filesystem", {})
+    where = source.get("file", "?")
+    if source.get("line"):
+        where = "{}:{}".format(where, source["line"])
+
+    raw = finding.get("Raw", "")
+    shown = raw[:12] + "..." if len(raw) > 12 else raw
+    state = "verified" if finding.get("Verified") else "unverified"
+
+    print("  {}: {} ({})".format(finding["DetectorName"], shown, state), file=sys.stderr)
+    print("    {}".format(where), file=sys.stderr)
+' >&2 || printf '%s\n' "$findings" >&2
+else
+    printf '%s\n' "$findings" >&2
+fi
+
+echo >&2
+echo "pre-commit: commit rejected. If this is a false positive, add a 'trufflehog:ignore'" >&2
+echo "pre-commit: comment on the line, or re-run the commit with TRUFFLEHOG_SKIP=1." >&2
+exit 1
