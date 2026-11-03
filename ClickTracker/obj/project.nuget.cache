@@ -1,0 +1,12 @@
+{
+  "version": 2,
+  "dgSpecHash": "Ffe9+nY57pE=",
+  "success": true,
+  "projectFilePath": "/home/daniel/Projects/ClickTracker/ClickTracker/ClickTracker.csproj",
+  "expectedPackageFiles": [
+    "/home/daniel/.nuget/packages/microsoft.aspnetcore.openapi/10.0.14/microsoft.aspnetcore.openapi.10.0.14.nupkg.sha512",
+    "/home/daniel/.nuget/packages/microsoft.openapi/2.12.2/microsoft.openapi.2.12.2.nupkg.sha512",
+    "/home/daniel/.nuget/packages/microsoft.aspnetcore.app.ref/10.0.14/microsoft.aspnetcore.app.ref.10.0.14.nupkg.sha512"
+  ],
+  "logs": []
+}
