@@ -4,10 +4,22 @@
         <TargetFramework>net10.0</TargetFramework>
         <Nullable>enable</Nullable>
         <ImplicitUsings>enable</ImplicitUsings>
+        <RootNamespace>ClickTracker</RootNamespace>
+        <PublishAot>true</PublishAot>
+        <InvariantGlobalization>true</InvariantGlobalization>
+        <EnableConfigurationBindingGenerator>true</EnableConfigurationBindingGenerator>
+        <!-- Some SDK installs ship without the PrunePackageData folder. The trimmer falls back to
+             analysing the framework assemblies directly, which is slower but produces the same result. -->
+        <AllowMissingPrunePackageData>true</AllowMissingPrunePackageData>
     </PropertyGroup>
 
     <ItemGroup>
-        <PackageReference Include="Microsoft.AspNetCore.OpenApi" Version="10.0.14"/>
+        <PackageReference Include="Microsoft.AspNetCore.OpenApi" Version="10.0.14" />
+        <PackageReference Include="Microsoft.Data.Sqlite" Version="10.0.14" />
+    </ItemGroup>
+
+    <ItemGroup>
+        <Content Update="links.json" CopyToOutputDirectory="PreserveNewest" CopyToPublishDirectory="PreserveNewest" />
     </ItemGroup>
 
 </Project>

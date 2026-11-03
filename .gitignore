@@ -1,0 +1,8 @@
+# Build output
+bin/
+obj/
+
+# Local click data
+*.db
+*.db-wal
+*.db-shm
