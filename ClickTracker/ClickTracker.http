@@ -1,6 +1,23 @@
 @ClickTracker_HostAddress = http://localhost:5235
+@AdminApiKey = replace-me
 
-GET {{ClickTracker_HostAddress}}/weatherforecast/
-Accept: application/json
+### Follow a short link
+GET {{ClickTracker_HostAddress}}/example
+Accept: */*
 
-###
+### List the links
+GET {{ClickTracker_HostAddress}}/admin/links
+X-Api-Key: {{AdminApiKey}}
+
+### Create or replace a link
+PUT {{ClickTracker_HostAddress}}/admin/links/docs
+X-Api-Key: {{AdminApiKey}}
+Content-Type: application/json
+
+{
+  "url": "https://example.com/handbook"
+}
+
+### Delete a link
+DELETE {{ClickTracker_HostAddress}}/admin/links/docs
+X-Api-Key: {{AdminApiKey}}

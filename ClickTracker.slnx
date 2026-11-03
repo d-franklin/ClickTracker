@@ -1,3 +1,4 @@
 <Solution>
   <Project Path="ClickTracker/ClickTracker.csproj" />
+  <Project Path="ClickTracker.Tests/ClickTracker.Tests.csproj" />
 </Solution>
