@@ -22,7 +22,8 @@
 //   TIME_UNIT      arrival rate time unit                    (default 1s)
 //   RAMP           ramp-up duration                          (default 10s)
 //   DURATION       steady-state duration                     (default 30s)
-//   PREALLOC_VUS   VUs pre-allocated for arrival rate        (default equals VUS)
+//   PREALLOC_VUS   VUs pre-allocated for arrival rate        (default scales with the rate)
+//   MAX_VUS        VU ceiling for arrival rate               (default 8x PREALLOC_VUS)
 //   P95_MS         p95 latency threshold in milliseconds     (default 50)
 //   P99_MS         p99 latency threshold in milliseconds     (default 200)
 //   FAIL_RATE      max accepted http_req_failed rate         (default 0.01)
@@ -47,7 +48,6 @@ const TIME_UNIT = __ENV.TIME_UNIT || '1s';
 const RAMP = __ENV.RAMP || '10s';
 const DURATION = __ENV.DURATION || '30s';
 const DRAIN = __ENV.DRAIN || '5s';
-const PREALLOC_VUS = Number(__ENV.PREALLOC_VUS || String(Math.max(1, VUS)));
 
 const P95_MS = Number(__ENV.P95_MS || '50');
 const P99_MS = Number(__ENV.P99_MS || '200');
@@ -56,19 +56,33 @@ const FAIL_RATE = Number(__ENV.FAIL_RATE || '0.01');
 // Optional id to target URL map, so the Location header can be checked rather than only the status.
 const LINK_TARGETS = __ENV.LINK_TARGETS ? JSON.parse(__ENV.LINK_TARGETS) : {};
 
+// clicktracker_redirect_ok covers both the GET and the HEAD path, since both resolve a link and
+// return a redirect.
 const redirectOk = new Rate('clicktracker_redirect_ok');
 const missOk = new Rate('clicktracker_miss_ok');
 const locationMismatch = new Counter('clicktracker_location_mismatch');
 
+// 404 is the expected answer for the miss path. Without this, k6 counts every miss as a failed
+// request and the failure rate measures the test mix rather than the service.
+const expectedStatuses = http.expectedStatuses(200, 302, 404);
+
 function buildScenario() {
   if (EXECUTOR === 'constant-arrival-rate') {
+    // VUs are not scaled with the arrival rate. Each VU holds a socket, and the local ephemeral
+    // port range only has room for a few tens of thousands, so a pre-allocated VU per request
+    // makes the load generator run out of ports before the service runs out of capacity.
+    const preAllocated = Number(
+      __ENV.PREALLOC_VUS || Math.min(500, Math.max(50, Math.ceil(RATE / 50)))
+    );
+    const max = Number(__ENV.MAX_VUS || preAllocated * 8);
+
     return {
       executor: 'constant-arrival-rate',
       rate: RATE,
       timeUnit: TIME_UNIT,
       duration: DURATION,
-      preAllocatedVUs: PREALLOC_VUS,
-      maxVUs: Math.max(PREALLOC_VUS, VUS * 4),
+      preAllocatedVUs: preAllocated,
+      maxVUs: max,
       gracefulStop: '10s',
     };
   }
@@ -86,6 +100,9 @@ function buildScenario() {
 }
 
 export const options = {
+  // The redirect itself is what is under test. Following it would measure the target site, not
+  // ClickTracker, so the Location header is inspected instead of being resolved.
+  maxRedirects: 0,
   scenarios: {
     redirects: buildScenario(),
   },
@@ -94,7 +111,8 @@ export const options = {
     'http_req_duration{name:redirect}': [`p(95)<${P95_MS}`, `p(99)<${P99_MS}`],
     'http_req_duration{name:not_found}': [`p(95)<${P95_MS}`, `p(99)<${P99_MS}`],
     'http_req_duration{name:head}': [`p(95)<${P95_MS}`, `p(99)<${P99_MS}`],
-    check: [`rate>${1 - FAIL_RATE}`],
+    clicktracker_redirect_ok: [`rate>${1 - FAIL_RATE}`],
+    clicktracker_miss_ok: [`rate>${1 - FAIL_RATE}`],
     clicktracker_location_mismatch: ['count==0'],
   },
   summaryTrendStats: ['avg', 'min', 'med', 'p(90)', 'p(95)', 'p(99)', 'max'],
@@ -118,7 +136,10 @@ export default function (data) {
   const roll = Math.random() * 100;
 
   if (roll < MISS_PERCENT) {
-    const response = http.get(`${BASE_URL}/${MISS_ID}`, { tags: { name: 'not_found' } });
+    const response = http.get(`${BASE_URL}/${MISS_ID}`, {
+      tags: { name: 'not_found' },
+      responseCallback: expectedStatuses,
+    });
     const ok = response.status === 404;
     missOk.add(ok);
     check(response, { 'miss returns 404': () => ok });
@@ -128,14 +149,20 @@ export default function (data) {
   const id = data.linkIds[Math.floor(Math.random() * data.linkIds.length)];
 
   if (roll < MISS_PERCENT + HEAD_PERCENT) {
-    const response = http.head(`${BASE_URL}/${id}`, { tags: { name: 'head' } });
+    const response = http.head(`${BASE_URL}/${id}`, {
+      tags: { name: 'head' },
+      responseCallback: expectedStatuses,
+    });
     const ok = response.status === 302;
     redirectOk.add(ok);
     check(response, { 'head returns 302': () => ok });
     return;
   }
 
-  const response = http.get(`${BASE_URL}/${id}`, { tags: { name: 'redirect' } });
+  const response = http.get(`${BASE_URL}/${id}`, {
+    tags: { name: 'redirect' },
+    responseCallback: expectedStatuses,
+  });
   const expected = LINK_TARGETS[id];
   const location = response.headers.Location;
 
